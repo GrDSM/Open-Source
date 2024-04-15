@@ -209,13 +209,20 @@ auto refresh_instance_state_for_domain(virDomainPtr domain, const mp::VirtualMac
         domain_state == VIR_DOMAIN_NOSTATE)
         return mp::VirtualMachine::State::unknown;
 
+    if (domain_state == VIR_DOMAIN_SHUTDOWN)
+        return mp::VirtualMachine::State::stopping;
+
     if (libvirt_wrapper->virDomainHasManagedSaveImage(domain, 0) == 1)
         return mp::VirtualMachine::State::suspended;
 
     // Most of these libvirt domain states don't have a Multipass instance state
     // analogue, so we'll treat them as "off".
-    const auto domain_off_states = {VIR_DOMAIN_BLOCKED, VIR_DOMAIN_PAUSED,  VIR_DOMAIN_SHUTDOWN,
-                                    VIR_DOMAIN_SHUTOFF, VIR_DOMAIN_CRASHED, VIR_DOMAIN_PMSUSPENDED};
+    const auto domain_off_states = {
+        VIR_DOMAIN_BLOCKED,
+        VIR_DOMAIN_PAUSED,
+        VIR_DOMAIN_SHUTOFF,
+        VIR_DOMAIN_CRASHED,
+        VIR_DOMAIN_PMSUSPENDED}; // TODO shouldn't we treat PMSUSPENDED as suspended? and maybe PAUSED as well?
 
     if (std::find(domain_off_states.begin(), domain_off_states.end(), domain_state) != domain_off_states.end())
         return mp::VirtualMachine::State::off;
@@ -299,7 +306,7 @@ mp::LibVirtVirtualMachine::~LibVirtVirtualMachine()
     update_suspend_status = false;
 
     if (state == State::running)
-        suspend();
+        suspend(); // TODO this can throw!
 }
 
 void mp::LibVirtVirtualMachine::start()
@@ -313,9 +320,10 @@ void mp::LibVirtVirtualMachine::start()
         domain = domain_by_name_for(vm_name, connection.get(), libvirt_wrapper);
 
     state = refresh_instance_state_for_domain(domain.get(), state, libvirt_wrapper);
-
     if (state == State::suspended)
         mpl::log(mpl::Level::info, vm_name, fmt::format("Resuming from a suspended state"));
+    else if (state == State::stopping)
+        throw std::runtime_error{fmt::format("Cannot start {} while it is stopping", vm_name)};
 
     state = State::starting;
     update_state();
@@ -385,9 +393,10 @@ void mp::LibVirtVirtualMachine::shutdown(const bool force)
             state_wait.wait(lock, [this] { return shutdown_while_starting; });
             update_state();
         }
-        else if (state == State::suspended)
+        else if (state == State::suspended || state == State::stopping)
         {
-            mpl::log(mpl::Level::info, vm_name, fmt::format("Ignoring shutdown issued while suspended"));
+            auto state_str = state == State::suspended ? "suspended" : "stopping";
+            mpl::log(mpl::Level::info, vm_name, fmt::format("Ignoring shutdown issued while {}", state_str));
         }
     }
 
@@ -416,9 +425,10 @@ void mp::LibVirtVirtualMachine::suspend()
             update_state();
         }
     }
-    else if (state == State::off)
+    else if (state == State::off || state == State::stopped || state == State::stopping)
     {
-        mpl::log(mpl::Level::info, vm_name, fmt::format("Ignoring suspend issued while stopped"));
+        auto state_str = state == State::stopping ? "stopping" : "stopped";
+        mpl::log(mpl::Level::info, vm_name, fmt::format("Ignoring suspend issued while {}", state_str));
     }
 
     monitor->on_suspend();

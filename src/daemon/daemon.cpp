@@ -970,6 +970,8 @@ mp::InstanceStatus::Status grpc_instance_status_for(const mp::VirtualMachine::St
     case mp::VirtualMachine::State::off:
     case mp::VirtualMachine::State::stopped:
         return mp::InstanceStatus::STOPPED;
+    case mp::VirtualMachine::State::stopping:
+        return mp::InstanceStatus::STOPPING;
     case mp::VirtualMachine::State::starting:
         return mp::InstanceStatus::STARTING;
     case mp::VirtualMachine::State::restarting:
@@ -2109,7 +2111,8 @@ try // clang-format on
         std::lock_guard lock{start_mutex};
         const auto& name = vm_it->first;
         auto& vm = *vm_it->second;
-        switch (vm.current_state())
+        auto state = vm.current_state();
+        switch (state)
         {
         case VirtualMachine::State::unknown:
         {
@@ -2118,9 +2121,16 @@ try // clang-format on
             fmt::format_to(std::back_inserter(start_errors), error_string);
             continue;
         }
+        case VirtualMachine::State::stopping:
         case VirtualMachine::State::suspending:
-            fmt::format_to(std::back_inserter(start_errors), "Cannot start the instance \'{}\' while suspending", name);
+        {
+            auto state_str = state == VirtualMachine::State::stopping ? "stopping" : "suspending";
+            fmt::format_to(std::back_inserter(start_errors),
+                           "Cannot start the instance \'{}\' while {}",
+                           name,
+                           state_str);
             continue;
+        }
         case VirtualMachine::State::delayed_shutdown:
             delayed_shutdown_instances.erase(name);
             continue;
@@ -3150,7 +3160,14 @@ grpc::Status mp::Daemon::reboot_vm(VirtualMachine& vm)
     if (vm.state == VirtualMachine::State::delayed_shutdown)
         delayed_shutdown_instances.erase(vm.vm_name);
 
-    if (!MP_UTILS.is_running(vm.current_state()))
+    // TODO@no-merge streamline this stuff
+    auto state = vm.current_state();
+    if (state == VirtualMachine::State::stopping)
+        return grpc::Status{grpc::StatusCode::INVALID_ARGUMENT,
+                            fmt::format("instance \"{}\" is currently stopping", vm.vm_name),
+                            ""};
+
+    if (!MP_UTILS.is_running(state))
         return grpc::Status{grpc::StatusCode::INVALID_ARGUMENT,
                             fmt::format("instance \"{}\" is not running", vm.vm_name), ""};
 
@@ -3164,7 +3181,7 @@ grpc::Status mp::Daemon::shutdown_vm(VirtualMachine& vm, const std::chrono::mill
     const auto& state = vm.current_state();
 
     using St = VirtualMachine::State;
-    const auto skip_states = {St::off, St::stopped, St::suspended};
+    const auto skip_states = {St::off, St::stopped, St::suspended, St::stopping};
 
     if (std::none_of(cbegin(skip_states), cend(skip_states), [&state](const auto& st) { return state == st; }))
     {
@@ -3220,10 +3237,16 @@ grpc::Status mp::Daemon::cancel_vm_shutdown(const VirtualMachine& vm)
 grpc::Status mp::Daemon::get_ssh_info_for_vm(VirtualMachine& vm, SSHInfoReply& response)
 {
     const auto& name = vm.vm_name;
-    if (vm.current_state() == VirtualMachine::State::unknown)
+    auto state = vm.current_state();
+
+    // TODO@no-merge streamline this stuff
+    if (state == VirtualMachine::State::unknown)
         throw std::runtime_error("Cannot retrieve credentials in unknown state");
 
-    if (!MP_UTILS.is_running(vm.current_state()))
+    if (state == VirtualMachine::State::stopping)
+        return grpc::Status{grpc::StatusCode::ABORTED, fmt::format("instance \"{}\" is stopping", name)};
+
+    if (!MP_UTILS.is_running(state))
         return grpc::Status{grpc::StatusCode::ABORTED, fmt::format("instance \"{}\" is not running", name)};
 
     if (vm.state == VirtualMachine::State::delayed_shutdown &&

@@ -307,6 +307,10 @@ void mp::QemuVirtualMachine::start()
         is_starting_from_suspend = true;
         network_deadline = std::chrono::steady_clock::now() + 5s;
     }
+    else if (state == State::stopping)
+    {
+        throw std::runtime_error(fmt::format("Cannot start {} while it is stopping", vm_name));
+    }
     else
     {
         // remove the mount arguments from the rest of the arguments, as they are stored separately for easier retrieval
@@ -403,9 +407,10 @@ void mp::QemuVirtualMachine::suspend()
         vm_process->wait_for_finished(timeout);
         vm_process.reset(nullptr);
     }
-    else if (state == State::off || state == State::suspended)
+    else if (state == State::off || state == State::stopped || state == State::suspended || state == State::stopping)
     {
-        mpl::log(mpl::Level::info, vm_name, fmt::format("Ignoring suspend issued while stopped/suspended"));
+        // TODO@no-merge use an util to get string from state enum (reuse where needed, e.g. CLI format utils)
+        mpl::log(mpl::Level::info, vm_name, fmt::format("Ignoring suspend issued while stopped/stopping/suspended"));
         monitor->on_suspend();
     }
 }
@@ -435,6 +440,13 @@ void mp::QemuVirtualMachine::on_started()
 void mp::QemuVirtualMachine::on_error()
 {
     state = State::off;
+    update_state();
+}
+
+void mp::QemuVirtualMachine::on_stopping()
+{
+    drop_ssh_session();
+    state = State::stopping;
     update_state();
 }
 
@@ -557,36 +569,45 @@ void mp::QemuVirtualMachine::initialize_vm_process()
 
     QObject::connect(vm_process.get(), &Process::ready_read_standard_output, [this]() {
         auto qmp_output = vm_process->read_all_standard_output();
-        mpl::log(mpl::Level::debug, vm_name, fmt::format("QMP: {}", qmp_output));
-        auto qmp_object = QJsonDocument::fromJson(qmp_output.split('\n').first()).object();
-        auto event = qmp_object["event"];
 
-        if (!event.isNull())
+        if (!qmp_output.endsWith('\n')) // TODO actually deal with this - it will probably have bad json
+            mpl::log(logging::Level::warning, vm_name, "partial QMP output");
+        else
+            mpl::log(mpl::Level::debug, vm_name, fmt::format("QMP: {}", qmp_output));
+
+        for (const auto& line : qmp_output.split('\n'))
         {
-            if (event.toString() == "RESET" && state != State::restarting)
+            auto qmp_object = QJsonDocument::fromJson(line).object();
+            auto event = qmp_object["event"];
+
+            if (!event.isNull())
             {
-                mpl::log(mpl::Level::info, vm_name, "VM restarting");
-                on_restart();
-            }
-            else if (event.toString() == "POWERDOWN")
-            {
-                mpl::log(mpl::Level::info, vm_name, "VM powering down");
-            }
-            else if (event.toString() == "SHUTDOWN")
-            {
-                mpl::log(mpl::Level::info, vm_name, "VM shut down");
-            }
-            else if (event.toString() == "STOP")
-            {
-                mpl::log(mpl::Level::info, vm_name, "VM suspending");
-            }
-            else if (event.toString() == "RESUME")
-            {
-                mpl::log(mpl::Level::info, vm_name, "VM suspended");
-                if (state == State::suspending || state == State::running)
+                if (event.toString() == "RESET" && state != State::restarting)
                 {
-                    vm_process->kill();
-                    on_suspend();
+                    mpl::log(mpl::Level::info, vm_name, "VM restarting");
+                    on_restart();
+                }
+                else if (event.toString() == "POWERDOWN")
+                {
+                    mpl::log(mpl::Level::info, vm_name, "VM powering down");
+                    on_stopping();
+                }
+                else if (event.toString() == "SHUTDOWN")
+                {
+                    mpl::log(mpl::Level::info, vm_name, "VM shut down");
+                }
+                else if (event.toString() == "STOP")
+                {
+                    mpl::log(mpl::Level::info, vm_name, "VM suspending");
+                }
+                else if (event.toString() == "RESUME")
+                {
+                    mpl::log(mpl::Level::info, vm_name, "VM suspended");
+                    if (state == State::suspending || state == State::running)
+                    {
+                        vm_process->kill();
+                        on_suspend();
+                    }
                 }
             }
         }

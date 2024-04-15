@@ -61,9 +61,10 @@ auto instance_state_for(const QString& name, mp::NetworkAccessManager* manager, 
     {
     case 101: // Started
     case 103: // Running
-    case 107: // Stopping
     case 111: // Thawed
         return mp::VirtualMachine::State::running;
+    case 107: // Stopping
+        return mp::VirtualMachine::State::stopping;
     case 102: // Stopped
         return mp::VirtualMachine::State::stopped;
     case 106: // Starting
@@ -252,6 +253,10 @@ void mp::LXDVirtualMachine::start()
         mpl::log(mpl::Level::info, vm_name, fmt::format("Resuming from a suspended state"));
         request_state("unfreeze");
     }
+    else if (state == State::stopping)
+    {
+        throw std::runtime_error(fmt::format("Cannot start {} while it is stopping", vm_name));
+    }
     else
     {
         request_state("start");
@@ -266,14 +271,17 @@ void mp::LXDVirtualMachine::shutdown(const bool force)
     std::unique_lock<decltype(state_mutex)> lock{state_mutex};
     auto present_state = current_state();
 
-    if (present_state == State::stopped)
+    if (present_state == State::stopped || present_state == State::off)
     {
         mpl::log(mpl::Level::debug, vm_name, "Ignoring stop request since instance is already stopped");
         return;
     }
-    else if (present_state == State::suspended && !force)
+    else if ((present_state == State::suspended || present_state == State::stopping) && !force)
     {
-        mpl::log(mpl::Level::info, vm_name, fmt::format("Ignoring shutdown issued while suspended"));
+        mpl::log(mpl::Level::info,
+                 vm_name,
+                 fmt::format("Ignoring shutdown issued while {}",
+                             present_state == State::suspended ? "suspended" : "stopping"));
         return;
     }
 
@@ -308,7 +316,8 @@ mp::VirtualMachine::State mp::LXDVirtualMachine::current_state()
             return state;
 
         state = present_state;
-        if (state == State::suspended || state == State::suspending || state == State::restarting)
+        if (state == State::suspended || state == State::suspending || state == State::restarting ||
+            state == State::stopping)
             drop_ssh_session();
     }
     catch (const LocalSocketConnectionException& e)
@@ -332,8 +341,17 @@ void mp::LXDVirtualMachine::ensure_vm_is_running()
 
 void mp::LXDVirtualMachine::ensure_vm_is_running(const std::chrono::milliseconds& timeout)
 {
+    static constexpr auto accepted_state = [](auto st) {
+        static constexpr auto skip_states = {State::off,
+                                             State::stopped,
+                                             State::stopping,
+                                             State::suspended,
+                                             State::suspending};
+        return std::none_of(skip_states.begin(), skip_states.end(), [st](auto s) { return st == s; });
+    };
+
     auto is_vm_running = [this, timeout] {
-        if (current_state() != State::stopped)
+        if (accepted_state(current_state()))
         {
             return true;
         }
@@ -341,7 +359,7 @@ void mp::LXDVirtualMachine::ensure_vm_is_running(const std::chrono::milliseconds
         // Sleep to see if LXD is just rebooting the instance
         std::this_thread::sleep_for(timeout);
 
-        if (current_state() != State::stopped)
+        if (accepted_state(current_state()))
         {
             state = State::starting;
             return true;
