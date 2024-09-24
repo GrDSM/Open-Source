@@ -1912,7 +1912,11 @@ try // clang-format on
     for (const auto& path_entry : request->target_paths())
     {
         const auto& name = path_entry.instance_name();
-        const auto target_path = QDir::cleanPath(QString::fromStdString(path_entry.target_path())).toStdString();
+        const auto requested_target_path = QDir::cleanPath(QString::fromStdString(path_entry.target_path()));
+        const auto q_target_path = requested_target_path.isEmpty()
+                                       ? MP_UTILS.default_mount_target(QString::fromStdString(request->source_path()))
+                                       : requested_target_path;
+        const auto target_path = q_target_path.toStdString();
 
         auto it = operative_instances.find(name);
         if (it == operative_instances.end())
@@ -1922,7 +1926,7 @@ try // clang-format on
         }
         auto& vm = it->second;
 
-        if (mp::utils::invalid_target_path(QString::fromStdString(target_path)))
+        if (mp::utils::invalid_target_path(q_target_path))
         {
             add_fmt_to(errors, "unable to mount to \"{}\"", target_path);
             continue;
